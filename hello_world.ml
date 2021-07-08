@@ -1,7 +1,6 @@
 
-
 open Base
-open Async
+(* open Unix *)
 
 module VC = struct
 
@@ -158,7 +157,7 @@ type ctx =
   }
 
   (* Run one round of processing in the in queue *)
-  let apply_once ctx : unit Deferred.t =
+  let apply_once ctx : unit =
     Nano_mutex.lock_exn ctx.lock;
     (* Fold over the in queue and apply all ops that are causally next
      after the current vc. Prune all old ops. This fold has side effects. *)
@@ -176,73 +175,74 @@ type ctx =
         else
           op :: acc_inq (* save and apply in the future*)) in
     ctx.inq := new_inq;
-    Nano_mutex.unlock_exn ctx.lock;
-    return ()
+    Nano_mutex.unlock_exn ctx.lock
 
 (* Loop and apply all applicable ops in the in queue *) 
-  let rec apply_ops ctx : unit Deferred.t =
-    (* We need one bind here so that the scheduler can schedule in another "thread" *)
-    apply_once ctx >>= (fun _ -> apply_ops ctx)
+let rec apply_loop ctx : unit =
+  apply_once ctx;
+  apply_loop ctx
 
-let buffer_size = 100 * 1024 (* 100 kilobytes *)
-let add_op ctx r =
-  let buffer = Bytes.create buffer_size in
-  Reader.read r buffer
-  >>= function
-  | `Eof -> return ()
-  | `Ok _ ->
-    (* TODO: this is a hack since we're only reading once. Fix. *)
-    let op = Counter.op_of_sexp (String.sexp_of_t (Bytes.to_string buffer)) in
-    Nano_mutex.lock_exn ctx.lock;
-    ctx.inq := op :: !(ctx.inq);
-    Nano_mutex.unlock_exn ctx.lock;
-    return ()
+(* Deserialize an op and add it to the in queue *)
+let add_op ctx raw_bytes : unit =
+  let op = Counter.op_of_sexp (String.sexp_of_t (Bytes.to_string raw_bytes)) in
+  Nano_mutex.lock_exn ctx.lock;
+  ctx.inq := op :: !(ctx.inq);
+  Nano_mutex.unlock_exn ctx.lock;
 
-let run_server ctx port =
-  Tcp.Server.create
-    ~on_handler_error:`Raise
-    (Tcp.Where_to_listen.of_port port)
-    (fun _addr r w ->
-      add_op ctx r
-      >>= (fun _ ->
-      Writer.write w "ACK";
-      Writer.flushed w))
+(** Aneris.network_helpers translation *)
 
-(* User-level commands *)
-type cmd_or_query =
-| Cmd of Counter.cmd
-| Query
+(*
+let udp_socket () = socket PF_INET SOCK_DGRAM 0
+
+let makeAddress ip port = ADDR_INET (ip, port)
+
+let socketBind socket addr = bind socket addr
+
+let receiveFrom skt =
+  let buffer = Bytes.create 1024 in
+  match recvfrom skt buffer 0 1024 [] with
+  | len, (ADDR_INET (addr, port) as sockaddr) ->
+    let msg = Caml.Bytes.sub_string buffer 0 len in
+    Some (msg, sockaddr)
+  | _ -> None
+*)
+
+(* TODO: figure out weird indentation problem *)
+type cmd =
+    | Cmd of Counter.cmd
+    | Query
 
 (* Read one command from stdin *)
-let get_cmd () =
+let get_cmd () = (
   match Caml.read_line () with
   | "inc" -> Some (Cmd Counter.Inc)
   | "dec" -> Some (Cmd Counter.Dec)
   | "q" -> Some Query
-  | _ -> None
+  | _ -> None)
 
 let rec io_loop ctx : unit = 
   (match get_cmd () with
-  |  None -> ()
+  |  None -> Caml.Printf.printf "invalid\n";
   | Some Query ->
     Caml.Printf.printf "%d\n" (Counter.query !(ctx.cnt))
   | Some (Cmd cmd) ->
     Nano_mutex.lock_exn ctx.lock;
-    let new_cnt, _ = Counter.local_update !(ctx.cnt) cmd in
+    let new_cnt, new_op = Counter.local_update !(ctx.cnt) cmd in
     ctx.cnt := new_cnt;
-    Nano_mutex.unlock_exn ctx.lock);
-    Caml.Printf.printf "%d\n" (Counter.query !(ctx.cnt));
+    (* TODO: make the out queue really a queue *)
+    ctx.outq := new_op :: !(ctx.outq);
+    Nano_mutex.unlock_exn ctx.lock;
+    Caml.Printf.printf "%d\n" (Counter.query !(ctx.cnt)));
     io_loop ctx
   
-  let () =
-    (* TODO: fill in details below *)
-    let ctx = {
-      cnt = ref (Counter.init ~addrs:["192.168.0.1"] ~local_addr:"192.168.0.1");
-      inq = ref [];
-      outq = ref [];
-      lock = Nano_mutex.create ();
-    } in
-    (* let port = 0 in *)
-    (* ignore(run_server ctx port : (Socket.Address.Inet.t, int) Tcp.Server.t Deferred.t); *)
-    io_loop ctx
-    (* ignore(Thread.create ~on_uncaught_exn:`Kill_whole_process io_loop ctx : Thread.t); *)
+let () =
+  (* TODO: fill in details below *)
+  let ctx = {
+    cnt = ref (Counter.init ~addrs:["192.168.0.1"] ~local_addr:"192.168.0.1");
+    inq = ref [];
+    outq = ref [];
+    lock = Nano_mutex.create ();
+  } in
+  ignore(Thread.create apply_loop ctx : Thread.t);
+  ignore(Thread.create server_loop ctx : Thread.t);
+  io_loop ctx
