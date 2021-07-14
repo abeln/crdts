@@ -186,9 +186,9 @@ let add_msg outq addr msg =
 
 let gen_ack vc addr = VC.seqnum vc addr |> Ack
 
-let rec receive_loop ctx =
-  let run () =
-    match A.receiveFrom ctx.skt with
+let receive_loop ctx =
+  let rec run () =
+    (match A.receiveFrom ctx.skt with
     | Some (msg, addr) ->
         let msg = msg_of_sexp (String.sexp_of_t msg) in
         Nano_mutex.lock_exn ctx.lock;
@@ -204,12 +204,13 @@ let rec receive_loop ctx =
                which also prunes stale ops. *)
             ctx.inq := (op, addr) :: !(ctx.inq));
         Nano_mutex.unlock_exn ctx.lock
-    | None -> ()
+    | None -> ());
+    run ()
   in
   run ()
 
 let send_loop ctx =
-  let run () =
+  let rec run () =
     Nano_mutex.lock_exn ctx.lock;
     let new_outq =
       List.fold !(ctx.outq) ~init:[] ~f:(fun acc entry ->
@@ -241,12 +242,13 @@ let send_loop ctx =
           (addr, new_msgs) :: acc)
     in
     ctx.outq := new_outq;
-    Nano_mutex.unlock_exn ctx.lock
+    Nano_mutex.unlock_exn ctx.lock;
+    run ()
   in
   run ()
 
-let rec apply_loop ctx : unit =
-  let run () =
+let apply_loop ctx : unit =
+  let rec run () =
     Nano_mutex.lock_exn ctx.lock;
     (* Fold over the in queue and apply all ops that are causally next
        after the current vc. Prune all old ops. This fold has side effects. *)
@@ -276,7 +278,8 @@ let rec apply_loop ctx : unit =
                 (op, addr) :: acc_inq)
     in
     ctx.inq := new_inq;
-    Nano_mutex.unlock_exn ctx.lock
+    Nano_mutex.unlock_exn ctx.lock;
+    run ()
   in
   run ()
 
