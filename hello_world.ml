@@ -189,17 +189,13 @@ let rec receive_loop ctx =
         Nano_mutex.lock_exn ctx.lock;
         (match msg with
         | Ack sn -> (
-            match List.Assoc.find !(ctx.acks) ~equal:( = ) addr with
-            | Some ack_sn ->
+            let ack_sn = List.Assoc.find_exn !(ctx.acks) ~equal:( = ) addr in
                 if sn = ack_sn + 1 then
                   ctx.acks := List.Assoc.add !(ctx.acks) ~equal:( = ) addr sn
                 else
                   (* ignore ack: if too small then it was already processed;
                      if too high then it was received out of order and it'll be re-sent *)
                   ()
-            | None ->
-                (* ignore: message from unknown address *)
-                ())
         | Op op ->
             (* All ops are added to the in-queue. Acks are issued in the apply loop,
                which also prunes stale ops. *)
