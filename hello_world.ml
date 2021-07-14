@@ -305,23 +305,32 @@ let rec io_loop ctx : unit =
       Caml.Printf.printf "%d\n" (Counter.query !(ctx.counter)));
   io_loop ctx
 
-(*
+let port = 2000
+
+let mk_addr ip_str = ADDR_INET (inet_addr_of_string ip_str, port)
+
 let () =
-  (* TODO: fill in details below *)
+  let argv = Sys.get_argv () in
+  let my_addr = mk_addr argv.(1) in
+  let addrs =
+    Array.to_list (Array.sub argv ~pos:2 ~len:(Array.length argv - 2))
+    |> List.map ~f:mk_addr
+  in
+  let skt = A.udp_socket () in
+  A.socketBind skt my_addr;
   let ctx =
     {
-      cnt =
-        ref (Counter.init ~addrs:[ "192.168.0.1" ] ~local_addr:"192.168.0.1");
+      acks = ref (List.map addrs ~f:(fun addr -> (addr, 0)));
+      addr = my_addr;
+      skt;
+      counter = ref (Counter.init ~addrs ~local_addr:my_addr);
       inq = ref [];
-      outq = ref [];
+      outq = ref (List.map addrs ~f:(fun addr -> (addr, [])));
       lock = Nano_mutex.create ();
     }
   in
-  let skt = A.udp_socket () in
-  let addr = A.makeAddress ip port in
-  A.socketBind skt addr;
   (* TODO: set socket receive timeout: https://ocaml.org/api/Unix.html#VALsetsockopt_float *)
   ignore (Thread.create apply_loop ctx : Thread.t);
-  ignore (Thread.create server_loop (ctx, skt) : Thread.t);
+  ignore (Thread.create receive_loop ctx : Thread.t);
+  ignore (Thread.create send_loop ctx : Thread.t);
   io_loop ctx
-*)
