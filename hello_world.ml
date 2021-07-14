@@ -172,6 +172,7 @@ type seqnum = int
 
 type ctx = {
   skt : file_descr;
+  addr : sockaddr;
   inq : (Counter.op * sockaddr) list ref;
   outq : (sockaddr, msg list) List.Assoc.t ref;
   acks : (sockaddr, seqnum) List.Assoc.t ref;
@@ -194,11 +195,9 @@ let rec receive_loop ctx =
         (match msg with
         | Ack sn ->
             let ack_sn = List.Assoc.find_exn !(ctx.acks) ~equal:( = ) addr in
-            if sn = ack_sn + 1 then
+            if sn > ack_sn then
               ctx.acks := List.Assoc.add !(ctx.acks) ~equal:( = ) addr sn
-            else
-              (* ignore ack: if too small then it was already processed;
-                 if too high then it was received out of order and it'll be re-sent *)
+            else (* ignore ack: it's too small so it was already processed *)
               ()
         | Op op ->
             (* All ops are added to the in-queue. Acks are issued in the apply loop,
@@ -258,8 +257,10 @@ let rec apply_loop ctx : unit =
           let op_vc = Counter.vc_of_op op in
           match VC.cmp vc op_vc with
           | VC.Gt | VC.Eq ->
-              (* prune old op, but also send an ack in case the previous one got lost *)
-              ctx.outq := add_msg !(ctx.outq) addr (gen_ack op_vc addr);
+              (* prune old op, but also send an ack in case the previous one got lost.
+                 Use the current vc instead of the op vc because the current vc is necessarily
+                 more up-to-date. *)
+              ctx.outq := add_msg !(ctx.outq) addr (gen_ack vc addr);
               acc_inq
           | _ ->
               if VC.causal_next ~vc_base:vc ~vc_next:op_vc then (
@@ -279,50 +280,7 @@ let rec apply_loop ctx : unit =
   in
   run ()
 
-(*          
-(* We need multiple threads:
-      1) the tcp server thread that reads messages and puts them in the in queue
-      3) a thread that processes user requests and puts them in the out queue
-      4) a thread that sends out queue requests
-      5) the in queue and out queue and counter and a mutex *)
-
-
-
-let rec server_loop (ctx, skt) =
-  (* TODO: figure out whether it's ok to receive strings *)
-  (match A.receiveFrom skt with
-  | Some (msg, _) ->
-      let op = Counter.op_of_sexp (String.sexp_of_t msg) in
-      Nano_mutex.lock_exn ctx.lock;
-      ctx.inq := op :: !(ctx.inq);
-      Nano_mutex.unlock_exn ctx.lock
-  | None -> ());
-  server_loop (ctx, skt)
-
-(* Send the op to all addresses in addrs using stop-and-wait *)
-let send_to_all op skt addrs =
-  let op_str = Sexp.to_string(Counter.sexp_of_op op) in
-  (* Implements stop-and-wait ARQ: https://en.wikipedia.org/wiki/Stop-and-wait_ARQ
-     without alternating bit, because we already do de-duplication via the vector clock *)
-  let rec send addr =
-    A.sendTo skt op_str addr;
-    match (A.receiveFrom skt) with  
-      Some (res, )
-  in
-  List.iter addrs ~f:send
-
-(* Send the messages in the out-queue to the given addresses *)
-let rec reply_loop (ctx, skt, addrs) =
-  Nano_mutex.lock_exn ctx.lock;
-  (match !(ctx.outq) with
-  | [] -> Nano_mutex.unlock_exn ctx.lock
-  | op :: ops ->
-      ctx.outq := ops;
-      Nano_mutex.unlock_exn ctx.lock;
-      send_to_all op skt addrs);
-  reply_loop (ctx, skt, addrs)
-
-type cmd = Cmd of Counter.cmd | Query
+type io_cmd = Cmd of Counter.cmd | Query
 
 (* Read one command from stdin *)
 let get_cmd () =
@@ -335,17 +293,19 @@ let get_cmd () =
 let rec io_loop ctx : unit =
   (match get_cmd () with
   | None -> Caml.Printf.printf "invalid\n"
-  | Some Query -> Caml.Printf.printf "%d\n" (Counter.query !(ctx.cnt))
+  | Some Query -> Caml.Printf.printf "%d\n" (Counter.query !(ctx.counter))
   | Some (Cmd cmd) ->
       Nano_mutex.lock_exn ctx.lock;
-      let new_cnt, new_op = Counter.local_update !(ctx.cnt) cmd in
-      ctx.cnt := new_cnt;
-      (* TODO: make the out queue really a queue *)
-      ctx.outq := new_op :: !(ctx.outq);
+      (* Apply the command locally *)
+      let new_counter, new_op = Counter.local_update !(ctx.counter) cmd in
+      ctx.counter := new_counter;
+      (* And then propagate it *)
+      ctx.outq := List.Assoc.map !(ctx.outq) ~f:(fun msgs -> Op new_op :: msgs);
       Nano_mutex.unlock_exn ctx.lock;
-      Caml.Printf.printf "%d\n" (Counter.query !(ctx.cnt)));
+      Caml.Printf.printf "%d\n" (Counter.query !(ctx.counter)));
   io_loop ctx
 
+(*
 let () =
   (* TODO: fill in details below *)
   let ctx =
