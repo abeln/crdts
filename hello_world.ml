@@ -47,13 +47,13 @@ module VC = struct
 
   type cmp_res = Lt | Gt | Eq | Co (* concurrent *)
 
-  let init ips = List.map ips ~f:(fun ip -> (ip, 0))
+  let init addrs = List.map addrs ~f:(fun addr -> (addr, 0))
 
   let cmp vc1 vc2 =
     assert (List.length vc1 = List.length vc2);
     List.fold vc1 ~init:Eq ~f:(fun acc e1 ->
         let k1, v1 = e1 in
-        let v2 = List.Assoc.find_exn vc2 ~equal:String.equal k1 in
+        let v2 = List.Assoc.find_exn vc2 ~equal:( = ) k1 in
         match acc with
         | Eq -> if v1 < v2 then Lt else if v1 > v2 then Gt else Eq
         | Lt -> if v1 > v2 then Co else Lt
@@ -64,7 +64,7 @@ module VC = struct
   let merge vc1 vc2 =
     assert (List.length vc1 = List.length vc2);
     List.map vc1 ~f:(function k1, v1 ->
-        (k1, Int.max v1 (List.Assoc.find_exn vc2 ~equal:String.equal k1)))
+        (k1, Int.max v1 (List.Assoc.find_exn vc2 ~equal:( = ) k1)))
 
   (* Does vc_next correspond to an operation that causally follows vc_base  without any interleaving operations?
      This is the case if every entry in vc_next is <= than the corresponding one in vc_base, except for exactly
@@ -73,7 +73,7 @@ module VC = struct
     assert (List.length vc_base = List.length vc_next);
     let counts =
       List.map vc_next ~f:(function next_k, next_v ->
-          let base_v = List.Assoc.find_exn vc_base ~equal:String.equal next_k in
+          let base_v = List.Assoc.find_exn vc_base ~equal:( = ) next_k in
           if next_v <= base_v then (1, 0)
           else if next_v = base_v + 1 then (0, 1)
           else (0, 0))
@@ -97,13 +97,13 @@ module type COUNTER = sig
 
   (* Creates a new counter with replicas at addrs, where the current node
      is at local_addr. *)
-  val init : sockaddr list -> local_addr:sockaddr -> t
+  val init : addrs:sockaddr list -> local_addr:sockaddr -> t
 
   (* The current value of the counter *)
   val query : t -> int
 
   (* Returns the vector clock of the current state of the counter *)
-  val get_vc : t -> VC.t
+  val vc_of_t : t -> VC.t
 
   (* Returns the vector clock corresponding to the operation *)
   val vc_of_op : op -> VC.t
@@ -118,7 +118,7 @@ module type COUNTER = sig
   val local_update : t -> cmd -> t * op
 end
 
-module Counter = struct
+module Counter : COUNTER = struct
   (* The state of the counter is a tuple
      (current value, vector clock of the last update, socket address ). *)
   type t = int * VC.t * sockaddr
@@ -133,31 +133,27 @@ module Counter = struct
     assert (List.mem addrs local_addr ~equal:( = ));
     (0, VC.init addrs, local_addr)
 
-  let query (cnt : t) =
-    let v, _, _ = cnt in
+  let query st =
+    let v, _, _ = st in
     v
 
-  let get_vc = function _, vc, _ -> vc
+  let vc_of_t = function _, vc, _ -> vc
 
   let vc_of_op = function _, vc -> vc
 
-  (* TODO: should we be incrementing the local VC for the counter here? *)
-  let update cnt oper =
-    let v, vc, ip = cnt in
-    let cmd, vc_op = oper in
+  (* TODO: should this check the op's vector clock? *)
+  let update st op =
+    let v, vc, addr = st in
+    let cmd, vc_op = op in
     let new_v = match cmd with Inc -> v + 1 | Dec -> v - 1 in
-    (new_v, VC.merge vc vc_op, ip)
+    (new_v, VC.merge vc vc_op, addr)
 
-  let local_update cnt cmd =
-    let _, vc, ip = cnt in
-    let ts = List.Assoc.find_exn vc ~equal:String.equal ip in
-    let new_vc =
-      List.Assoc.add
-        (List.Assoc.remove vc ~equal:String.equal ip)
-        ~equal:String.equal ip (ts + 1)
-    in
+  let local_update st cmd =
+    let _, vc, addr = st in
+    let ts = List.Assoc.find_exn vc ~equal:( = ) addr in
+    let new_vc = List.Assoc.add vc ~equal:( = ) addr (ts + 1) in
     let new_op = (cmd, new_vc) in
-    (update cnt new_op, new_op)
+    (update st new_op, new_op)
 end
 
 (* Two kinds of operations:
@@ -188,14 +184,14 @@ let rec receive_loop ctx =
         let msg = msg_of_sexp (String.sexp_of_t msg) in
         Nano_mutex.lock_exn ctx.lock;
         (match msg with
-        | Ack sn -> (
+        | Ack sn ->
             let ack_sn = List.Assoc.find_exn !(ctx.acks) ~equal:( = ) addr in
-                if sn = ack_sn + 1 then
-                  ctx.acks := List.Assoc.add !(ctx.acks) ~equal:( = ) addr sn
-                else
-                  (* ignore ack: if too small then it was already processed;
-                     if too high then it was received out of order and it'll be re-sent *)
-                  ()
+            if sn = ack_sn + 1 then
+              ctx.acks := List.Assoc.add !(ctx.acks) ~equal:( = ) addr sn
+            else
+              (* ignore ack: if too small then it was already processed;
+                 if too high then it was received out of order and it'll be re-sent *)
+              ()
         | Op op ->
             (* All ops are added to the in-queue. Acks are issued in the apply loop,
                which also prunes stale ops. *)
