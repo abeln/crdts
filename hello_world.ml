@@ -83,6 +83,8 @@ module VC = struct
     in
     let le_count, next_count = List.fold counts ~init:(0, 0) ~f:pair_add in
     le_count + next_count = List.length vc_base
+
+  let seqnum vc addr = List.Assoc.find_exn vc ~equal:( = ) addr
 end
 
 module type COUNTER = sig
@@ -170,12 +172,18 @@ type seqnum = int
 
 type ctx = {
   skt : file_descr;
-  inq : Counter.op list ref;
+  inq : (Counter.op * sockaddr) list ref;
   outq : (sockaddr, msg list) List.Assoc.t ref;
   acks : (sockaddr, seqnum) List.Assoc.t ref;
-  current_vc : VC.t;
+  counter : Counter.t ref;
   lock : Nano_mutex.t;
 }
+
+let add_msg outq addr msg =
+  let msgs = List.Assoc.find_exn outq ~equal:( = ) addr in
+  List.Assoc.add outq ~equal:( = ) addr (msg :: msgs)
+
+let gen_ack vc addr = VC.seqnum vc addr |> Ack
 
 let rec receive_loop ctx =
   let run () =
@@ -195,7 +203,7 @@ let rec receive_loop ctx =
         | Op op ->
             (* All ops are added to the in-queue. Acks are issued in the apply loop,
                which also prunes stale ops. *)
-            ctx.inq := op :: !(ctx.inq));
+            ctx.inq := (op, addr) :: !(ctx.inq));
         Nano_mutex.unlock_exn ctx.lock
     | None -> ()
   in
@@ -238,100 +246,47 @@ let send_loop ctx =
   in
   run ()
 
-(*
-module type RCB = sig
-  type msg = VC.t * string
-
-  type t
-
-  val init : file_descr -> sockaddr -> t
-
-  val receiveFrom : t -> (msg * sockaddr) option
-
-  val sendTo : t -> msg -> sockaddr list -> unit
-end
-
-module Mailbox = struct
-  type op = Op of VC.t * string [@@deriving sexp]
-
-  type msg = Ack of int | OpMsg of op [@@deriving sexp]
-
-  type seqnum = int
-
-  type t = {
-    skt : file_descr;
-    inq : op list ref;
-    outq : (sockaddr, msg list) List.Assoc.t ref;
-    seen : (sockaddr, seqnum * bool) List.Assoc.t ref;
-    lock : Nano_mutex.t;
-  }
-
-  (* Check whether the given ack with sequence number 'sn' is the
-     expected one for the given 'addr'. *)
-  let expect_sn seen addr sn =
-    List.exists seen ~f:(function
-      | seen_addr, (seen_sn, false) -> seen_addr = addr && seen_sn = sn
-      | _ -> false)
-
-  let rec receive_loop st =
-    let run () =
-      match A.receiveFrom st.skt with
-      | Some (msg, addr) ->
-          let msg = msg_of_sexp (String.sexp_of_t msg) in
-          Nano_mutex.lock_exn st.lock;
-          (match msg with
-          | Ack sn ->
-              if expect_sn !(st.seen) addr sn then
-                st.seen := List.Assoc.add !(st.seen) ~equal:( = ) addr (sn, true)
-              else ()
-          | OpMsg op -> st.inq := op :: !(st.inq));
-          Nano_mutex.unlock_exn st.lock
-      | None -> ()
+let rec apply_loop ctx : unit =
+  let run () =
+    Nano_mutex.lock_exn ctx.lock;
+    (* Fold over the in queue and apply all ops that are causally next
+       after the current vc. Prune all old ops. This fold has side effects. *)
+    let new_inq =
+      List.fold !(ctx.inq) ~init:[] ~f:(fun acc_inq op_and_addr ->
+          let op, addr = op_and_addr in
+          let vc = Counter.vc_of_t !(ctx.counter) in
+          let op_vc = Counter.vc_of_op op in
+          match VC.cmp vc op_vc with
+          | VC.Gt | VC.Eq ->
+              (* prune old op, but also send an ack in case the previous one got lost *)
+              ctx.outq := add_msg !(ctx.outq) addr (gen_ack op_vc addr);
+              acc_inq
+          | _ ->
+              if VC.causal_next ~vc_base:vc ~vc_next:op_vc then (
+                (* We can apply the op as a side effect *)
+                ctx.counter := Counter.update !(ctx.counter) op;
+                (* Now acknowledge it *)
+                ctx.outq := add_msg !(ctx.outq) addr (gen_ack op_vc addr);
+                (* Prune it from the list *)
+                acc_inq)
+              else
+                (* save and apply in the future : don't acknowledge because
+                   we haven't applied it *)
+                (op, addr) :: acc_inq)
     in
-    run ()
+    ctx.inq := new_inq;
+    Nano_mutex.unlock_exn ctx.lock
+  in
+  run ()
 
-  let rec send_loop st =
-    let run () = 
-      true
-    in
-    run ()
-
-  let init skt addr = ()
-
-  let receiveFrom st = ()
-end
-
+(*          
 (* We need multiple threads:
       1) the tcp server thread that reads messages and puts them in the in queue
       3) a thread that processes user requests and puts them in the out queue
       4) a thread that sends out queue requests
       5) the in queue and out queue and counter and a mutex *)
 
-(* Loop and apply all applicable ops in the in queue *)
-let rec apply_loop ctx : unit =
-  Nano_mutex.lock_exn ctx.lock;
-  (* Fold over the in queue and apply all ops that are causally next
-     after the current vc. Prune all old ops. This fold has side effects. *)
-  let new_inq =
-    List.fold !(ctx.inq)
-      ~init:([] : Counter.op list)
-      ~f:(fun (acc_inq : Counter.op list) op ->
-        let vc = Counter.get_vc !(ctx.cnt) in
-        let op_vc = Counter.get_op_vc op in
-        match VC.cmp vc op_vc with
-        | VC.Gt | VC.Eq -> acc_inq (* prune old op *)
-        | _ ->
-            if VC.causal_next ~vc_base:vc ~vc_next:op_vc then (
-              (* We can apply the op as a side effect *)
-              ctx.cnt := Counter.update !(ctx.cnt) op;
-              (* Prune it from the list *)
-              acc_inq)
-            else op :: acc_inq
-        (* save and apply in the future*))
-  in
-  ctx.inq := new_inq;
-  Nano_mutex.unlock_exn ctx.lock;
-  apply_loop ctx
+
 
 let rec server_loop (ctx, skt) =
   (* TODO: figure out whether it's ok to receive strings *)
