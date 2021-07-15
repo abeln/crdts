@@ -1,4 +1,4 @@
 (executable
- (name hello_world)
+ (name counter)
  (libraries core async sexplib)
  (preprocess (pps ppx_jane)))
