@@ -2,6 +2,8 @@ open Base
 open Unix
 
 let ( = ) = Poly.( = )
+let ( > ) = Poly.( > )
+
 
 (** Aneris.network_helpers translation *)
 module A = struct
@@ -189,8 +191,9 @@ let gen_ack vc addr = VC.seqnum vc addr |> Ack
 let receive_loop ctx =
   let rec run () =
     (match A.receiveFrom ctx.skt with
-    | Some (msg, addr) ->
-        let msg = msg_of_sexp (String.sexp_of_t msg) in
+    | Some (raw_msg, addr) ->
+        let msg = msg_of_sexp (Parsexp.Single.parse_string_exn raw_msg) in
+        (* Caml.Printf.printf "received message %s\n" raw_msg; *)
         Nano_mutex.lock_exn ctx.lock;
         (match msg with
         | Ack sn ->
@@ -210,6 +213,7 @@ let receive_loop ctx =
   run ()
 
 let send_loop ctx =
+  let last_op_sent_secs = ref (Unix.time ()) in
   let rec run () =
     Nano_mutex.lock_exn ctx.lock;
     let new_outq =
@@ -221,19 +225,22 @@ let send_loop ctx =
                 match m with
                 | Ack _ ->
                     (* we always send all acks immediately *)
-                    A.sendTo ctx.skt (String.t_of_sexp (sexp_of_msg m)) addr;
+                    A.sendTo ctx.skt (Sexp.to_string (sexp_of_msg m)) addr;
                     (* remove the ack *)
                     ms
                 | Op op ->
                     let vc = Counter.vc_of_op op in
-                    let sn_op = List.Assoc.find_exn vc ~equal:( = ) addr in
+                    let sn_op = List.Assoc.find_exn vc ~equal:( = ) ctx.addr in
                     if sn_op <= sn then
                       (* The op has already been acked, and can now be removed *)
                       ms
-                    else if sn_op = sn + 1 then (
-                      (* We're implementing stop-and-wait, so the next op can be sent *)
-                      A.sendTo ctx.skt (String.t_of_sexp (sexp_of_msg m)) addr;
-                      ms)
+                    else if sn_op = sn + 1 && ((Unix.time ()) -. !last_op_sent_secs > 1.0) then (
+                      (* We're implementing stop-and-wait, so the next op can be sent.
+                         Wait at least a second between sent ops so we give other replicas time to reply. *)
+                      A.sendTo ctx.skt (Sexp.to_string (sexp_of_msg m)) addr;
+                      last_op_sent_secs := Unix.time ();
+                      (* Leave the op around until it's acked *)
+                      m :: ms)
                     else
                       (* The op should be sent, but only after a previous op is acknowledged,
                          so do nothing for now *)
@@ -308,27 +315,39 @@ let rec io_loop ctx : unit =
       Caml.Printf.printf "%d\n" (Counter.query !(ctx.counter)));
   io_loop ctx
 
-let port = 2000
+(* TODO: use the Aneris version instead *)
+let mk_addr ip_str port_str =
+  ADDR_INET (inet_addr_of_string ip_str, Int.of_string port_str)
 
-let mk_addr ip_str = ADDR_INET (inet_addr_of_string ip_str, port)
+let splitList lst =
+  let l, r, _ =
+    List.fold lst ~init:([], [], true) ~f:(fun acc e ->
+        match acc with
+        | l, r, true -> (e :: l, r, false)
+        | l, r, false -> (l, e :: r, true))
+  in
+  (l, r)
 
 let () =
   let argv = Sys.get_argv () in
-  let my_addr = mk_addr argv.(1) in
-  let addrs =
-    Array.to_list (Array.sub argv ~pos:2 ~len:(Array.length argv - 2))
-    |> List.map ~f:mk_addr
+  let my_addr = mk_addr argv.(1) argv.(2) in
+  let other_addrs =
+    Array.to_list (Array.sub argv ~pos:3 ~len:(Array.length argv - 3))
+    |> splitList
+    |> (function l, r -> List.zip_exn l r)
+    |> List.map ~f:(function addr, port -> mk_addr addr port)
   in
+  let addrs = my_addr :: other_addrs in
   let skt = A.udp_socket () in
   A.socketBind skt my_addr;
   let ctx =
     {
-      acks = ref (List.map addrs ~f:(fun addr -> (addr, 0)));
+      acks = ref (List.map other_addrs ~f:(fun addr -> (addr, 0)));
       addr = my_addr;
       skt;
       counter = ref (Counter.init ~addrs ~local_addr:my_addr);
       inq = ref [];
-      outq = ref (List.map addrs ~f:(fun addr -> (addr, [])));
+      outq = ref (List.map other_addrs ~f:(fun addr -> (addr, [])));
       lock = Nano_mutex.create ();
     }
   in
