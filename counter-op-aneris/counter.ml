@@ -1,6 +1,4 @@
-(* #directory "+threads";;
- * #load "unix.cma";;
- * #load "threads.cma";; *)
+(* Original CCDDB code by Leon Gondelman *)
 
 open Unix
 
@@ -22,11 +20,6 @@ let receiveFrom skt =
 let sendTo skt msg sktaddr =
   let _ = sendto skt (Bytes.of_string msg) 0 (String.length msg) [] sktaddr
   in ()
-
-let sendToAll_index i skt msg sktaddrl =
-  List.iteri (fun j sa -> if i <> j then sendTo skt msg sa) sktaddrl
-
-
 
 let rec listen skt handle =
   match (receiveFrom skt) with
@@ -115,22 +108,44 @@ let prod_deser deserA deserB s =
     (v1, v2)
   with _ -> assert false
 
+let either_ser left_ser right_ser v =
+  match v with
+  | (1, lv) -> "1_" ^ (left_ser lv)
+  | (2, rv) -> "2_" ^ (right_ser rv)
+  | _ -> assert false
+
+let either_deser left_deser right_deser s =
+  let i = String.index s '_' in
+  let len = String.length s - 2 in
+  match (String.sub s 0 1) with
+  | "1" -> left_deser (String.sub s (i + 1) len)
+  | "2" -> right_deser (String.sub s (i + 1) len)
+  | _ -> assert false
+
 let we_serialize =
   prod_ser
     (prod_ser
-       (prod_ser string_ser val_ser) vect_serialize) int_ser
+       (either_ser (prod_ser string_ser val_ser) 
+                   (prod_ser string_ser val_ser))
+       vect_serialize) int_ser
 
 let we_deserialize =
   prod_deser
     (prod_deser
-       (prod_deser string_deser val_deser) vect_deserialize) int_deser
+       (either_deser (prod_deser string_deser val_deser)
+                     (prod_deser string_deser val_deser))
+        vect_deserialize) int_deser
 
+
+(* Type aliases for Ocaml but not present in Aneris *)
+type vc = int list
+type cmd = (int * (string * int))
+type oper = ((cmd * vc) * int)
 
 (* CCDDB manual translation  *)
-let pi1 (((x,y),z),w) = x
-let pi2 (((x,y),z),w) = y
-let pi3 (((x,y),z),w) = z
-let pi4 (((x,y),z),w) = w
+let pi1 ((x,y),z) = x
+let pi2 ((x,y),z) = y
+let pi3 ((x,y),z) = z
 
 let rec find f l = match l with
   | [] -> None
@@ -141,13 +156,13 @@ let rec find f l = match l with
         | None -> None
 
 let check vc i w =
-  let (wt, wo) = (pi3 w, pi4 w) in
+  let (wt, wo) = (pi2 w, pi3 w) in
   let test1 = (i != wo) in
   let test2 = (wo < List.length vc) in
   let test3 = (vect_applicable wt vc wo) in
   test1 && test2 && test3
 
-let apply db vc lock iq i =
+let apply ctr vc lock (iq : oper list ref) i =
   let rec aux () =
     Thread.delay 1.;
     acquire lock;
@@ -155,25 +170,55 @@ let apply db vc lock iq i =
       match (find (check !vc i) !iq) with
       | Some (w, iq') ->
          iq := iq';
-         db := dict_insert (pi1 w) (pi2 w) !db;
-         vc := vect_inc !vc (pi4 w);
+         (match (pi1 w) with
+         | (1, inc) -> ctr := !ctr + (snd inc)
+         | (2, dec) -> ctr := !ctr - (snd dec)
+         | _ -> assert false);
+         vc := vect_inc !vc (pi3 w);
       | None -> ()
     end;
-      release lock; aux ()
+    release lock; aux ()
   in aux ()
 
-let send_thread i skt lock l oq =
+let sendNext i skt (mq : oper Queue.t) sktaddrl acks =
+  let rec aux () =
+    if (Queue.is_empty mq) then ()
+    else (
+      let op = Queue.peek mq in 
+      let vc = pi2 op in
+      let dest = pi3 op in
+      let sn = vect_nth vc i in
+      let sn_ack = List.nth acks dest in
+      if (sn = sn_ack) then
+        (* The current message was acked, so we can move on
+           to the next one.  *)
+        (Queue.pop mq;
+         aux ())
+      else if (sn = sn_ack + 1) then
+        (* The current message hasn't been acked.
+           We should send or re-send it, in case
+           it wasn't previously received.  *)
+        sendTo skt (we_serialize op) (List.nth sktaddrl dest)
+      else
+        (* No other cases are possible:
+           - sn < sn_ack is not possible because we would've already sent the message
+           - sn > sn_ack + 1 is not possible because it means we sent two messages in a row
+             without waiting for an ack *) 
+        assert false
+    )
+    in
+    aux ()
+
+let send_thread i skt lock l acks oq =
   let rec aux () =
     Thread.delay 1.;
     acquire lock;
     match !oq with
     | [] -> release lock; aux ()
-    | w :: oq' ->
-       oq := oq'; release lock;
-       sendToAll_index i skt (we_serialize w) l;
-       (* Printf.printf "<debug sent>  %s \n"  (we_serialize w); *)
-       (* flush Stdlib.stdout; *)
-       aux ()
+    | msgs :: oq' ->
+      sendNext i skt msgs l acks;
+      release lock;
+      aux ()
   in aux ()
 
 let receive_thread skt lock iq =
@@ -205,14 +250,31 @@ let write db vc oq lock i x v =
   release lock
 
 let init l i =
-  let (db : (string * int) list ref) = ref (dict_empty ()) in
-  let vc = ref (vect_make (List.length l) 0) in
-  let (iq, oq) = (ref [], ref []) in
+  let (ctr : int ref) = ref 0 in
+  let n = List.length l in
+  let vc = ref (vect_make n 0) in
+  (* The in-queue contains a list of operations.
+     An operation is a tuple (payload, vector-clock, source-index).
+     The payload is either an inc or a dec.
+     An (inc v) is represented as (1, ("INC", v)).
+     A (dec v) is represented as (2, ("DEC", v)).
+
+     The out-queue is a map of replica index to a queue of operations
+     sorted increasingly by sequence number.
+     An operation is represented as in the in-queue.
+     The sequence number for replica i is the ith entry in the vector clock
+     corresponding to the operation.
+  *)
+  let (iq : oper list ref) = ref [] in
+  let (oq : (oper Queue.t) list ref) = ref (vect_make n (Queue.create ())) in
+  (* A vector that maps replica indices to the highest ack
+     received from that replica. *)
+  let (acks : int list ref) = ref (vect_make (List.length l) 0) in
   let lock = newlock () in
   let skt = udp_socket () in
   socketBind skt (List.nth l i);
-  let _ = Thread.create (apply db vc lock iq) i in
-  let _ = Thread.create (send_thread i skt lock l) oq in
+  let _ = Thread.create (apply ctr vc lock iq) i in
+  let _ = Thread.create (send_thread i skt lock l acks) oq in
   let _ = Thread.create (receive_thread skt lock) iq in
   (read db lock, write db vc oq lock i)
 
