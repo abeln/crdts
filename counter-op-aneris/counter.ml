@@ -180,7 +180,7 @@ let apply ctr vc lock (iq : oper list ref) i =
     release lock; aux ()
   in aux ()
 
-let sendNext i skt (mq : oper Queue.t) sktaddrl acks =
+let sendNext i skt mq sktaddrl acks =
   let rec aux () =
     if (Queue.is_empty mq) then ()
     else (
@@ -215,8 +215,8 @@ let send_thread i skt lock l acks oq =
     acquire lock;
     match !oq with
     | [] -> release lock; aux ()
-    | msgs :: oq' ->
-      sendNext i skt msgs l acks;
+    | mq :: oq' ->
+      sendNext i skt mq l acks;
       release lock;
       aux ()
   in aux ()
