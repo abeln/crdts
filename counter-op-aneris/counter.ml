@@ -188,7 +188,7 @@ let sendNext i skt mq sktaddrl acks =
       let vc = pi2 op in
       let dest = pi3 op in
       let sn = vect_nth vc i in
-      let sn_ack = List.nth acks dest in
+      let sn_ack = List.nth !acks dest in
       if (sn = sn_ack) then
         (* The current message was acked, so we can move on
            to the next one.  *)
