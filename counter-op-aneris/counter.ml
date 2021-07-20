@@ -129,7 +129,7 @@ let either_deser left_deser right_deser s =
 
 (* Type aliases for Ocaml but not present in Aneris *)
 type vc = int list
-type cmd = ((string * int), (string * int)) Either.t 
+type cmd = string * int (* ("INC", v) or ("DEC", v) *)
 type oper = ((cmd * vc) * int)
 type seqnum = int
 type ack = (string * seqnum) * int (* (("ACK", seqnum), sender-id) *)
@@ -143,16 +143,14 @@ let msg_of_ack ack = Right ack
 let oper_ser = 
   prod_ser
     (prod_ser
-       (either_ser (prod_ser string_ser int_ser) 
-                   (prod_ser string_ser int_ser))
+      (prod_ser string_ser int_ser)
        vect_serialize)
     int_ser
 
 let oper_deser =
   prod_deser
     (prod_deser
-     (either_deser (prod_deser string_deser int_deser)
-                   (prod_deser string_deser int_deser))
+     (prod_deser string_deser int_deser)
       vect_deserialize)
     int_deser
 
@@ -199,8 +197,10 @@ let apply ctr vc lock (iq : oper list ref) i =
          let sender_id = pi3 op in
          iq := iq';
          (match cmd with
-         | Left inc -> ctr := !ctr + (snd inc)
-         | Right dec -> ctr := !ctr - (snd dec));
+         | ("INC", v) -> ctr := !ctr + v
+         | ("DEC", v) -> ctr := !ctr - v
+         | _ -> assert false
+         );
          vc := vect_inc !vc sender_id;
       | None -> ()
     end;
@@ -296,21 +296,28 @@ let receive_thread i skt lock vc iq =
     release lock; aux ()
   in aux ()
 
-let read db lock x =
+let read ctr lock =
   (* Printf.printf "<debug> reading db before lock \n"; *)
   acquire lock;
   Thread.delay 0.3;
   (* Printf.printf "<debug> reading db \n"; *)
   (* flush Stdlib.stdout; *)
-  let r = dict_lookup x !db in
+  let r = !ctr in
   release lock; r
 
-let write db vc oq lock i x v =
+let update ctr vc oq lock i cmd =
   acquire lock;
   Thread.delay 0.1;
   vc := vect_inc !vc i;
-  db := dict_insert x v !db;
-  oq := (((x, v), !vc), i) :: !oq;
+  let tag = fst cmd in
+  let v = snd cmd in
+  let op = mk_oper cmd !vc i in
+  (match tag with
+  | "INC" -> ctr := !ctr + v
+  | "DEC" -> ctr := !ctr - v
+  | _ -> assert false);
+  (* Put the new op in every out-queue *)
+  List.iter (fun q -> Queue.push op q) !oq;
   release lock
 
 let init l i =
@@ -340,7 +347,7 @@ let init l i =
   let _ = Thread.create (apply ctr vc lock iq) i in
   let _ = Thread.create (send_thread i skt lock l acks) oq in
   let _ = Thread.create (receive_thread i skt lock vc) iq in
-  (read db lock, write db vc oq lock i)
+  (read ctr lock, update ctr vc oq lock i)
 
 (** Execution *)
 let action i rd wr =
