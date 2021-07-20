@@ -1,6 +1,7 @@
 (* Original CCDDB code by Leon Gondelman *)
 
 open Unix
+open Either
 
 (** Aneris.network_helpers translation *)
 let udp_socket () = socket PF_INET SOCK_DGRAM 0
@@ -108,40 +109,65 @@ let prod_deser deserA deserB s =
     (v1, v2)
   with _ -> assert false
 
+(* In AnerisLang we don't have ADTs, but we don't have types either.
+   So in Ocaml for (de)serializing sums we use proper sums, but in
+   AnerisLang we use tuples where the type of the second compoenent 
+   depends on the tag (the first component). *)
+
 let either_ser left_ser right_ser v =
   match v with
-  | (1, lv) -> "1_" ^ (left_ser lv)
-  | (2, rv) -> "2_" ^ (right_ser rv)
-  | _ -> assert false
+  | Left lv -> "1_" ^ (left_ser lv)
+  | Right rv -> "2_" ^ (right_ser rv)
 
 let either_deser left_deser right_deser s =
   let i = String.index s '_' in
   let len = String.length s - 2 in
   match (String.sub s 0 1) with
-  | "1" -> left_deser (String.sub s (i + 1) len)
-  | "2" -> right_deser (String.sub s (i + 1) len)
+  | "1" -> Left (left_deser (String.sub s (i + 1) len))
+  | "2" -> Right (right_deser (String.sub s (i + 1) len))
   | _ -> assert false
-
-let we_serialize =
-  prod_ser
-    (prod_ser
-       (either_ser (prod_ser string_ser val_ser) 
-                   (prod_ser string_ser val_ser))
-       vect_serialize) int_ser
-
-let we_deserialize =
-  prod_deser
-    (prod_deser
-       (either_deser (prod_deser string_deser val_deser)
-                     (prod_deser string_deser val_deser))
-        vect_deserialize) int_deser
-
 
 (* Type aliases for Ocaml but not present in Aneris *)
 type vc = int list
-type cmd = (int * (string * int))
+type cmd = ((string * int), (string * int)) Either.t 
 type oper = ((cmd * vc) * int)
+type seqnum = int
+type ack = (string * seqnum) * int (* (("ACK", seqnum), sender-id) *)
 
+let mk_ack sn sender_id : ack = (("ACK", sn), sender_id)
+let mk_oper cmd vc sender_id : oper = ((cmd, vc), sender_id)
+
+let msg_of_oper op = Left op
+let msg_of_ack ack = Right ack
+
+let oper_ser = 
+  prod_ser
+    (prod_ser
+       (either_ser (prod_ser string_ser int_ser) 
+                   (prod_ser string_ser int_ser))
+       vect_serialize)
+    int_ser
+
+let oper_deser =
+  prod_deser
+    (prod_deser
+     (either_deser (prod_deser string_deser int_deser)
+                   (prod_deser string_deser int_deser))
+      vect_deserialize)
+    int_deser
+
+let ack_ser =
+  prod_ser (prod_ser string_ser int_ser)
+           int_ser
+
+let ack_deser =
+  prod_deser (prod_deser string_deser int_deser)
+             int_deser
+
+let msg_ser = either_ser oper_ser ack_ser
+  
+let msg_deser = either_deser oper_deser ack_deser
+  
 (* CCDDB manual translation  *)
 let pi1 ((x,y),z) = x
 let pi2 ((x,y),z) = y
@@ -168,13 +194,14 @@ let apply ctr vc lock (iq : oper list ref) i =
     acquire lock;
     begin
       match (find (check !vc i) !iq) with
-      | Some (w, iq') ->
+      | Some (op, iq') ->
+         let cmd = pi1 op in
+         let sender_id = pi3 op in
          iq := iq';
-         (match (pi1 w) with
-         | (1, inc) -> ctr := !ctr + (snd inc)
-         | (2, dec) -> ctr := !ctr - (snd dec)
-         | _ -> assert false);
-         vc := vect_inc !vc (pi3 w);
+         (match cmd with
+         | Left inc -> ctr := !ctr + (snd inc)
+         | Right dec -> ctr := !ctr - (snd dec));
+         vc := vect_inc !vc sender_id;
       | None -> ()
     end;
     release lock; aux ()
@@ -183,29 +210,36 @@ let apply ctr vc lock (iq : oper list ref) i =
 let sendNext i skt mq sktaddrl acks =
   let rec aux () =
     if (Queue.is_empty mq) then ()
-    else (
-      let op = Queue.peek mq in 
+    else
+    begin
+      let (op : oper) = Queue.peek mq in 
       let vc = pi2 op in
       let dest = pi3 op in
       let sn = vect_nth vc i in
       let sn_ack = List.nth !acks dest in
       if (sn = sn_ack) then
-        (* The current message was acked, so we can move on
-           to the next one.  *)
-        (Queue.pop mq;
-         aux ())
+        begin
+          (* The current message was acked, so we can move on
+             to the next one.  *)
+          let _ = Queue.pop mq in
+          aux ()
+        end
       else if (sn = sn_ack + 1) then
-        (* The current message hasn't been acked.
-           We should send or re-send it, in case
-           it wasn't previously received.  *)
-        sendTo skt (we_serialize op) (List.nth sktaddrl dest)
+        begin
+          (* The current message hasn't been acked.
+             We should send or re-send it, in case
+             it wasn't previously received.  *)
+          sendTo skt (msg_ser (msg_of_oper op)) (List.nth sktaddrl dest)
+        end
       else
-        (* No other cases are possible:
-           - sn < sn_ack is not possible because we would've already sent the message
-           - sn > sn_ack + 1 is not possible because it means we sent two messages in a row
-             without waiting for an ack *) 
-        assert false
-    )
+        begin
+          (* No other cases are possible:
+            - sn < sn_ack is not possible because we would've already sent the message
+            - sn > sn_ack + 1 is not possible because it means we sent two messages in a row
+              without waiting for an ack *) 
+          assert false
+        end
+    end
     in
     aux ()
 
@@ -221,14 +255,44 @@ let send_thread i skt lock l acks oq =
       aux ()
   in aux ()
 
-let receive_thread skt lock iq =
+let receive_thread i skt lock vc iq =
   let rec aux () =
     Thread.delay 0.5;
-    let (msg, _) = listen_wait skt in
+    let (msg, addr) = listen_wait skt in
     (* Printf.printf "<debug received> %s \n" msg; *)
     (* flush Stdlib.stdout; *)
     acquire lock;
-    iq := (we_deserialize msg) :: !iq;
+    (match (msg_deser msg) with
+    | Left op ->
+        let sender_vc = pi2 op in
+        let sender = pi3 op in
+        let sender_sn = vect_nth sender_vc sender in
+        let my_sn = vect_nth !vc sender in
+        if (sender_sn < my_sn) then
+          begin
+            (* Must be a network duplicate, so ignore it *)
+          end
+        else if (sender_sn = my_sn) then
+          begin
+            (* Could be a duplicate, but it could also be that our ack
+               got lost, so resend the ack  *)
+            sendTo skt (msg_ser (msg_of_ack (mk_ack sender_sn i))) addr
+          end
+        else if (sender_sn = my_sn + 1) then
+          begin
+            (* This is a new message from the sender, so we need to store it
+               and ack it. *)
+            iq := op :: !iq;
+            sendTo skt (msg_ser (msg_of_ack (mk_ack sender_sn i))) addr
+          end
+        else
+          begin
+            (* We must have sender_sn > my_sn + 1, but that can't happen because
+               we're running stop-and-wait *)
+            assert false
+          end
+    | Right ack -> ()
+    );
     release lock; aux ()
   in aux ()
 
@@ -275,7 +339,7 @@ let init l i =
   socketBind skt (List.nth l i);
   let _ = Thread.create (apply ctr vc lock iq) i in
   let _ = Thread.create (send_thread i skt lock l acks) oq in
-  let _ = Thread.create (receive_thread skt lock) iq in
+  let _ = Thread.create (receive_thread i skt lock vc) iq in
   (read db lock, write db vc oq lock i)
 
 (** Execution *)
