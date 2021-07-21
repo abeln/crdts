@@ -219,17 +219,16 @@ let apply ctr vc lock (iq : oper list ref) i =
   aux ()
 
 let sendNext i dest skt mq sktaddrl acks =
-  Printf.printf "<debug sendNext> i = %d dest = %d empty = %b\n" i dest
-    (Queue.is_empty mq);
+  (* Printf.printf "<debug sendNext> i = %d dest = %d empty = %b\n" i dest (Queue.is_empty mq); *)
   let rec aux () =
     if Queue.is_empty mq then ()
     else
       let (op : oper) = Queue.peek mq in
       let vc = pi2 op in
-      Printf.printf "<debug sendNext> i = %d dest = %d\n" i dest;
+      (* Printf.printf "<debug sendNext> i = %d dest = %d\n" i dest; *)
       let sn = vect_nth vc i in
       let sn_ack = List.nth !acks dest in
-      Printf.printf "<debug sendNext> sn = %d sn_ack = %d\n" sn sn_ack;
+      (* Printf.printf "<debug sendNext> sn = %d sn_ack = %d\n" sn sn_ack; *)
       if sn = sn_ack then
         (* The current message was acked, so we can move on
            to the next one. *)
@@ -252,7 +251,7 @@ let sendNext i dest skt mq sktaddrl acks =
 
 let send_thread i skt lock l acks oq =
   let rec aux () =
-    Printf.printf "<debug send> sending \n";
+    (* Printf.printf "<debug send> sending \n"; *)
     Thread.delay 1.;
     acquire lock;
     List.iteri
@@ -267,7 +266,7 @@ let receive_thread i skt lock vc acks iq =
   let rec aux () =
     Thread.delay 0.5;
     let msg, addr = listen_wait skt in
-    Printf.printf "<debug received> %s \n" msg;
+    (* Printf.printf "<debug received> %s \n" msg; *)
     flush Stdlib.stdout;
     acquire lock;
     (match msg_deser msg with
@@ -293,12 +292,11 @@ let receive_thread i skt lock vc acks iq =
                we're running stop-and-wait *)
             false
     | Right ack ->
-      let sn = pi2 ack in
-      let sender = pi3 ack in
-      let curr_sn = List.nth !acks sender in
-      Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn;
-      acks := vect_update !acks sender (max sn curr_sn)
-    );
+        let sn = pi2 ack in
+        let sender = pi3 ack in
+        let curr_sn = List.nth !acks sender in
+        (* Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn; *)
+        acks := vect_update !acks sender (max sn curr_sn));
     release lock;
     aux ()
   in
@@ -329,7 +327,7 @@ let update ctr vc oq lock i cmd =
   (* Put the new op in every out-queue except ours *)
   List.iteri
     (fun j q ->
-      Printf.printf "<debug update> j = %d\n" j;
+      (* Printf.printf "<debug update> j = %d\n" j;  *)
       if j <> i then Queue.push op q)
     !oq;
   release lock
