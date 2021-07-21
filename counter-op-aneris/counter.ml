@@ -219,6 +219,8 @@ let apply ctr vc lock (iq : oper list ref) i =
   aux ()
 
 let sendNext i dest skt mq sktaddrl acks =
+  Printf.printf "<debug sendNext> i = %d dest = %d empty = %b\n" i dest
+    (Queue.is_empty mq);
   let rec aux () =
     if Queue.is_empty mq then ()
     else
@@ -248,11 +250,17 @@ let sendNext i dest skt mq sktaddrl acks =
   aux ()
 
 let send_thread i skt lock l acks oq =
-  Printf.printf "<debug send> sending \n";
-  Thread.delay 1.;
-  acquire lock;
-  List.iteri (fun dest q -> if dest <> i then sendNext i dest skt q l acks) !oq;
-  release lock
+  let rec aux () =
+    Printf.printf "<debug send> sending \n";
+    Thread.delay 1.;
+    acquire lock;
+    List.iteri
+      (fun dest q -> if dest <> i then sendNext i dest skt q l acks)
+      !oq;
+    release lock;
+    aux ()
+  in
+  aux ()
 
 let receive_thread i skt lock vc iq =
   let rec aux () =
