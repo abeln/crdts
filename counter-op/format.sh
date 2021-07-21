@@ -1,2 +1,2 @@
 #!/bin/bash
-ocamlformat --enable-outside-detected-project --inplace hello_world.ml
+ocamlformat --enable-outside-detected-project --inplace counter.ml
