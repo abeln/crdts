@@ -19,8 +19,11 @@ let receiveFrom skt =
   | _ -> None
 
 let sendTo skt msg sktaddr =
-  let _ = sendto skt (Bytes.of_string msg) 0 (String.length msg) [] sktaddr in
-  ()
+  if (Random.int 2 = 0) then
+    Printf.printf "<debug sendTo> message dropped\n"
+  else
+    let _ = sendto skt (Bytes.of_string msg) 0 (String.length msg) [] sktaddr in
+    ()
 
 let rec listen skt handle =
   match receiveFrom skt with
@@ -118,11 +121,6 @@ let prod_deser deserA deserB s =
     let v2 = deserB s2 in
     (v1, v2)
   with _ -> assert false
-
-(* In AnerisLang we don't have ADTs, but we don't have types either.
-   So in Ocaml for (de)serializing sums we use proper sums, but in
-   AnerisLang we use tuples where the type of the second compoenent 
-   depends on the tag (the first component). *)
 
 let either_ser left_ser right_ser v =
   match v with Left lv -> "1_" ^ left_ser lv | Right rv -> "2_" ^ right_ser rv
@@ -266,7 +264,7 @@ let receive_thread i skt lock vc acks iq =
   let rec aux () =
     Thread.delay 0.5;
     let msg, addr = listen_wait skt in
-    (* Printf.printf "<debug received> %s \n" msg; *)
+    Printf.printf "<debug received> %s \n" msg;
     flush Stdlib.stdout;
     acquire lock;
     (match msg_deser msg with
@@ -295,7 +293,7 @@ let receive_thread i skt lock vc acks iq =
         let sn = pi2 ack in
         let sender = pi3 ack in
         let curr_sn = List.nth !acks sender in
-        (* Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn; *)
+        Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn;
         acks := vect_update !acks sender (max sn curr_sn));
     release lock;
     aux ()
