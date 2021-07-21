@@ -218,13 +218,13 @@ let apply ctr vc lock (iq : oper list ref) i =
   in
   aux ()
 
-let sendNext i skt mq sktaddrl acks =
+let sendNext i dest skt mq sktaddrl acks =
   let rec aux () =
     if Queue.is_empty mq then ()
     else
       let (op : oper) = Queue.peek mq in
       let vc = pi2 op in
-      let dest = pi3 op in
+      Printf.printf "<debug sendNext> i = %d dest = %d\n" i dest;
       let sn = vect_nth vc i in
       let sn_ack = List.nth !acks dest in
       if sn = sn_ack then
@@ -248,26 +248,18 @@ let sendNext i skt mq sktaddrl acks =
   aux ()
 
 let send_thread i skt lock l acks oq =
-  let rec aux () =
-    Thread.delay 1.;
-    acquire lock;
-    match !oq with
-    | [] ->
-        release lock;
-        aux ()
-    | mq :: oq' ->
-        sendNext i skt mq l acks;
-        release lock;
-        aux ()
-  in
-  aux ()
+  Printf.printf "<debug send> sending \n";
+  Thread.delay 1.;
+  acquire lock;
+  List.iteri (fun dest q -> if dest <> i then sendNext i dest skt q l acks) !oq;
+  release lock
 
 let receive_thread i skt lock vc iq =
   let rec aux () =
     Thread.delay 0.5;
     let msg, addr = listen_wait skt in
-    (* Printf.printf "<debug received> %s \n" msg; *)
-    (* flush Stdlib.stdout; *)
+    Printf.printf "<debug received> %s \n" msg;
+    flush Stdlib.stdout;
     acquire lock;
     (match msg_deser msg with
     | Left op ->
@@ -318,8 +310,13 @@ let update ctr vc oq lock i cmd =
   | "INC" -> ctr := !ctr + v
   | "DEC" -> ctr := !ctr - v
   | _ -> assert false);
-  (* Put the new op in every out-queue *)
-  List.iter (fun q -> Queue.push op q) !oq;
+  Printf.printf "<debug update> i = %d\n" i;
+  (* Put the new op in every out-queue except ours *)
+  List.iteri
+    (fun j q ->
+      Printf.printf "<debug update> j = %d\n" j;
+      if j <> i then Queue.push op q)
+    !oq;
   release lock
 
 let init l i =
@@ -373,8 +370,8 @@ let init_exec () =
     exit 2);
   let ip = (gethostbyname "localhost").h_addr_list.(0) in
   let l =
-    let dbsa i = makeAddress ip (int_of_string Sys.argv.(i + 2)) in
-    List.init (Array.length Sys.argv - 2) dbsa
+    let sa i = makeAddress ip (int_of_string Sys.argv.(i + 2)) in
+    List.init (Array.length Sys.argv - 2) sa
   in
   let i = int_of_string Sys.argv.(1) in
   let rd, upd = init l i in
