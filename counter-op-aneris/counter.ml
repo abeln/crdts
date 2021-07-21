@@ -229,6 +229,7 @@ let sendNext i dest skt mq sktaddrl acks =
       Printf.printf "<debug sendNext> i = %d dest = %d\n" i dest;
       let sn = vect_nth vc i in
       let sn_ack = List.nth !acks dest in
+      Printf.printf "<debug sendNext> sn = %d sn_ack = %d\n" sn sn_ack;
       if sn = sn_ack then
         (* The current message was acked, so we can move on
            to the next one. *)
@@ -262,7 +263,7 @@ let send_thread i skt lock l acks oq =
   in
   aux ()
 
-let receive_thread i skt lock vc iq =
+let receive_thread i skt lock vc acks iq =
   let rec aux () =
     Thread.delay 0.5;
     let msg, addr = listen_wait skt in
@@ -291,7 +292,13 @@ let receive_thread i skt lock vc iq =
             (* We must have sender_sn > my_sn + 1, but that can't happen because
                we're running stop-and-wait *)
             false
-    | Right ack -> ());
+    | Right ack ->
+      let sn = pi2 ack in
+      let sender = pi3 ack in
+      let curr_sn = List.nth !acks sender in
+      Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn;
+      acks := vect_update !acks sender (max sn curr_sn)
+    );
     release lock;
     aux ()
   in
@@ -353,7 +360,7 @@ let init l i =
   socketBind skt (List.nth l i);
   let _ = Thread.create (apply ctr vc lock iq) i in
   let _ = Thread.create (send_thread i skt lock l acks) oq in
-  let _ = Thread.create (receive_thread i skt lock vc) iq in
+  let _ = Thread.create (receive_thread i skt lock vc acks) iq in
   (read ctr lock, update ctr vc oq lock i)
 
 (** Execution *)
