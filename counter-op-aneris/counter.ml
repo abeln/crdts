@@ -3,6 +3,9 @@
 open Unix
 open Either
 
+(* TODO: use Leon's immutable queue:
+   https://github.com/logsem/viewstamped-replication/blob/master/theories/code/util.v *)
+
 (** Aneris.network_helpers translation *)
 let udp_socket () = socket PF_INET SOCK_DGRAM 0
 
@@ -294,6 +297,7 @@ let receive_thread i skt lock vc acks iq =
         let sender = pi3 ack in
         let curr_sn = List.nth !acks sender in
         Printf.printf "<debug receive> it's an ack sn = %d sender = %d curr_sn = %d\n" sn sender curr_sn;
+        assert (sn <= curr_sn);
         acks := vect_update !acks sender (max sn curr_sn));
     release lock;
     aux ()
